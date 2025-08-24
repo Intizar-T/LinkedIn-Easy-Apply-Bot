@@ -4,8 +4,10 @@ import json
 import csv
 import logging
 import os
+import platform
 import random
 import re
+import stat
 import time
 from datetime import datetime, timedelta
 import getpass
@@ -65,7 +67,13 @@ class EasyApplyBot:
                  filename='output.csv',
                  blacklist=[],
                  blackListTitles=[],
-                 experience_level=[]
+                 experience_level=[],
+                 max_applications=50,
+                 min_salary_yearly=60000,
+                 min_salary_hourly=32,
+                 send_recruiter_invites=True,
+                 skip_zero_experience=True,
+                 use_linkedin_resume=True
                  ) -> None:
 
         log.info("Welcome to Easy Apply Bot")
@@ -95,13 +103,44 @@ class EasyApplyBot:
         self.appliedJobIDs: list = past_ids if past_ids != None else []
         self.filename: str = filename
         self.options = self.browser_options()
-        self.browser = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=self.options)
+        try:
+            # Try to use ChromeDriverManager first
+            self.browser = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=self.options)
+        except Exception as e:
+            log.warning(f"ChromeDriverManager failed: {e}")
+            try:
+                # Try using system ChromeDriver
+                self.browser = webdriver.Chrome(options=self.options)
+            except Exception as e2:
+                log.error(f"System ChromeDriver also failed: {e2}")
+                # Try using the local assets ChromeDriver
+                system = platform.system().lower()
+                if system == "darwin":
+                    chromedriver_path = "./assets/chromedriver_darwin"
+                elif system == "linux":
+                    chromedriver_path = "./assets/chromedriver_linux"
+                else:
+                    chromedriver_path = "./assets/chromedriver_windows"
+                
+                # Make it executable
+                if os.path.exists(chromedriver_path):
+                    os.chmod(chromedriver_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+                    self.browser = webdriver.Chrome(service=ChromeService(chromedriver_path), options=self.options)
+                else:
+                    raise Exception("No valid ChromeDriver found")
         self.wait = WebDriverWait(self.browser, 30)
         self.blacklist = blacklist
         self.blackListTitles = blackListTitles
         self.start_linkedin(username, password)
         self.phone_number = phone_number
         self.experience_level = experience_level
+        self.max_applications = max_applications
+        self.applications_count = 0
+        self.min_salary_yearly = min_salary_yearly
+        self.min_salary_hourly = min_salary_hourly
+        self.send_recruiter_invites = send_recruiter_invites
+        self.skip_zero_experience = skip_zero_experience
+        self.use_linkedin_resume = use_linkedin_resume
 
 
         self.locator = {
@@ -177,13 +216,37 @@ class EasyApplyBot:
         log.info("Logging in.....Please wait :)  ")
         self.browser.get("https://www.linkedin.com/login?trk=guest_homepage-basic_nav-header-signin")
         try:
-            user_field = self.browser.find_element("id","username")
-            pw_field = self.browser.find_element("id","password")
-            login_button = self.browser.find_element("xpath",
-                        '//*[@id="organic-div"]/form/div[3]/button')
+            # Wait for page to load
+            time.sleep(3)
+            
+            user_field = self.browser.find_element(By.ID, "username")
+            pw_field = self.browser.find_element(By.ID, "password")
+            
+            # Try multiple selectors for the login button
+            login_button = None
+            login_selectors = [
+                (By.XPATH, "//button[@type='submit']"),
+                (By.XPATH, "//button[contains(@class, 'sign-in-form__submit')]"),
+                (By.XPATH, "//button[contains(text(), 'Sign in')]"),
+                (By.CSS_SELECTOR, "button[type='submit']"),
+                (By.XPATH, '//*[@id="organic-div"]/form/div[3]/button')
+            ]
+            
+            for selector_type, selector_value in login_selectors:
+                try:
+                    login_button = self.browser.find_element(selector_type, selector_value)
+                    break
+                except:
+                    continue
+            
+            if not login_button:
+                raise Exception("Login button not found")
+            
+            user_field.clear()
             user_field.send_keys(username)
             user_field.send_keys(Keys.TAB)
             time.sleep(2)
+            pw_field.clear()
             pw_field.send_keys(password)
             time.sleep(2)
             login_button.click()
@@ -236,14 +299,15 @@ class EasyApplyBot:
         self.browser, _ = self.next_jobs_page(position, location, jobs_per_page, experience_level=self.experience_level)
         log.info("Looking for jobs.. Please wait..")
 
-        while time.time() - start_time < self.MAX_SEARCH_TIME:
+        while time.time() - start_time < self.MAX_SEARCH_TIME and self.applications_count < self.max_applications:
             try:
                 log.info(f"{(self.MAX_SEARCH_TIME - (time.time() - start_time)) // 60} minutes left in this search")
+                log.info(f"Applications submitted: {self.applications_count}/{self.max_applications}")
 
                 # sleep to make sure everything loads, add random to make us look human.
-                randoTime: float = random.uniform(1.5, 2.9)
+                randoTime: float = random.uniform(2.0, 4.5)
                 log.debug(f"Sleeping for {round(randoTime, 1)}")
-                #time.sleep(randoTime)
+                time.sleep(randoTime)
                 self.load_page(sleep=0.5)
 
                 # LinkedIn displays the search results in a scrollable <div> on the left side, we have to scroll to its bottom
@@ -295,6 +359,11 @@ class EasyApplyBot:
 
             except Exception as e:
                 print(e)
+        
+        if self.applications_count >= self.max_applications:
+            log.info(f"Application limit reached! Successfully submitted {self.applications_count} applications.")
+        else:
+            log.info(f"Search completed. Total applications submitted: {self.applications_count}")
     def apply_loop(self, jobIDs):
         for jobID in jobIDs:
             if jobIDs[jobID] == "To be processed":
@@ -305,14 +374,100 @@ class EasyApplyBot:
                     log.info(f"Failed to apply to {jobID}")
                 jobIDs[jobID] == applied
 
+    def parse_salary(self, job_description):
+        """
+        Parse salary information from job description text.
+        Returns (yearly_salary, hourly_salary) or (None, None) if not found.
+        """
+        # Convert to lowercase for easier matching
+        text = job_description.lower()
+        
+        # Patterns for yearly salary (£60,000, £60000, £60k)
+        yearly_patterns = [
+            r'£\s*(\d{1,3}(?:,\d{3})*)\s*(?:per\s+year|annually|/year|p\.a\.)',
+            r'£\s*(\d{2,3})k\s*(?:per\s+year|annually|/year|p\.a\.)',
+            r'(\d{1,3}(?:,\d{3})*)\s*£\s*(?:per\s+year|annually|/year|p\.a\.)',
+            r'salary.*?£\s*(\d{1,3}(?:,\d{3})*)',
+            r'£\s*(\d{1,3}(?:,\d{3})*)\s*-\s*£\s*(\d{1,3}(?:,\d{3})*)',  # range
+        ]
+        
+        # Patterns for hourly salary (£32/hour, £32 per hour)
+        hourly_patterns = [
+            r'£\s*(\d{1,3}(?:\.\d{2})?)\s*(?:per\s+hour|/hour|hourly)',
+            r'(\d{1,3}(?:\.\d{2})?)\s*£\s*(?:per\s+hour|/hour|hourly)',
+        ]
+        
+        # Check yearly patterns
+        for pattern in yearly_patterns:
+            matches = re.findall(pattern, text)
+            if matches:
+                try:
+                    if isinstance(matches[0], tuple):  # salary range
+                        # Take the lower bound of the range
+                        salary_str = matches[0][0]
+                    else:
+                        salary_str = matches[0]
+                    
+                    # Handle 'k' notation
+                    if 'k' in text and salary_str.isdigit():
+                        yearly_salary = int(salary_str) * 1000
+                    else:
+                        yearly_salary = int(salary_str.replace(',', ''))
+                    
+                    return yearly_salary, None
+                except (ValueError, IndexError):
+                    continue
+        
+        # Check hourly patterns
+        for pattern in hourly_patterns:
+            matches = re.findall(pattern, text)
+            if matches:
+                try:
+                    hourly_salary = float(matches[0])
+                    return None, hourly_salary
+                except (ValueError, IndexError):
+                    continue
+        
+        return None, None
+
+    def meets_salary_requirements(self, yearly_salary, hourly_salary):
+        """
+        Check if the salary meets minimum requirements.
+        Returns True if salary meets requirements or if no salary found.
+        """
+        if yearly_salary is None and hourly_salary is None:
+            # No salary found, apply anyway
+            return True
+        
+        if yearly_salary is not None:
+            meets_yearly = yearly_salary >= self.min_salary_yearly
+            log.info(f"Yearly salary: £{yearly_salary:,} - Meets requirement (>= £{self.min_salary_yearly:,}): {meets_yearly}")
+            return meets_yearly
+        
+        if hourly_salary is not None:
+            meets_hourly = hourly_salary >= self.min_salary_hourly
+            log.info(f"Hourly salary: £{hourly_salary} - Meets requirement (>= £{self.min_salary_hourly}): {meets_hourly}")
+            return meets_hourly
+        
+        return True
+
     def apply_to_job(self, jobID):
         # #self.avoid_lock() # annoying
 
         # get job page
         self.get_job_page(jobID)
 
-        # let page load
-        time.sleep(1)
+        # let page load with human-like delay
+        time.sleep(random.uniform(1.5, 3.0))
+        
+        # Check salary requirements
+        job_description = self.browser.page_source
+        yearly_salary, hourly_salary = self.parse_salary(job_description)
+        
+        if not self.meets_salary_requirements(yearly_salary, hourly_salary):
+            log.info(f"Skipping job {jobID}: salary below requirements")
+            self.write_to_file(False, jobID, self.browser.title, False, "* Salary below requirements")
+            return False
 
         # get easy apply button
         button = self.get_easy_apply_button()
@@ -329,13 +484,24 @@ class EasyApplyBot:
                 log.info("Clicking the EASY apply button")
                 button.click()
                 clicked = True
-                time.sleep(1)
+                time.sleep(random.uniform(1.5, 2.5))
                 self.fill_out_fields()
-                result: bool = self.send_resume()
-                if result:
+                result = self.send_resume()
+                if result is True:
                     string_easy = "*Applied: Sent Resume"
+                    self.applications_count += 1
+                    log.info(f"Application submitted! Total applications: {self.applications_count}")
+                    
+                    # Try to connect with recruiter after successful application
+                    if self.send_recruiter_invites:
+                        time.sleep(random.uniform(2, 4))  # Human-like delay
+                        self.try_connect_with_recruiter(jobID)
+                elif result == "skipped_experience":
+                    string_easy = "*Skipped: Zero experience in required skills"
+                    result = False
                 else:
                     string_easy = "*Did not apply: Failed to send Resume"
+                    result = False
         elif "You applied on" in self.browser.page_source:
             log.info("You have already applied to this position.")
             string_easy = "* Already Applied"
@@ -352,7 +518,7 @@ class EasyApplyBot:
         self.write_to_file(button, jobID, self.browser.title, result)
         return result
 
-    def write_to_file(self, button, jobID, browserTitle, result) -> None:
+    def write_to_file(self, button, jobID, browserTitle, result, reason=None) -> None:
         def re_extract(text, pattern):
             target = re.search(pattern, text)
             if target:
@@ -422,6 +588,11 @@ class EasyApplyBot:
                                               locator[1])) > 0
 
     def send_resume(self) -> bool:
+        """
+        Handle the application submission process.
+        If use_linkedin_resume is True, skips file uploads and uses existing LinkedIn resume.
+        If use_linkedin_resume is False, uploads local files from config.
+        """
         def is_present(button_locator) -> bool:
             return len(self.browser.find_elements(button_locator[0],
                                                   button_locator[1])) > 0
@@ -444,23 +615,35 @@ class EasyApplyBot:
             loop = 0
             while loop < 2:
                 time.sleep(1)
-                # Upload resume
+                # Upload resume - only if use_linkedin_resume is False
                 if is_present(upload_resume_locator):
-                    #upload_locator = self.browser.find_element(By.NAME, "file")
-                    try:
-                        resume_locator = self.browser.find_element(By.XPATH, "//*[contains(@id, 'jobs-document-upload-file-input-upload-resume')]")
-                        resume = self.uploads["Resume"]
-                        resume_locator.send_keys(resume)
-                    except Exception as e:
-                        log.error(e)
-                        log.error("Resume upload failed")
-                        log.debug("Resume: " + resume)
-                        log.debug("Resume Locator: " + str(resume_locator))
-                # Upload cover letter if possible
+                    if not self.use_linkedin_resume and "Resume" in self.uploads:
+                        #upload_locator = self.browser.find_element(By.NAME, "file")
+                        try:
+                            resume_locator = self.browser.find_element(By.XPATH, "//*[contains(@id, 'jobs-document-upload-file-input-upload-resume')]")
+                            resume = self.uploads["Resume"]
+                            resume_locator.send_keys(resume)
+                            log.info("Uploaded local resume file")
+                        except Exception as e:
+                            log.error(e)
+                            log.error("Resume upload failed")
+                            log.debug("Resume: " + str(self.uploads.get("Resume", "None")))
+                            log.debug("Resume Locator: " + str(resume_locator))
+                    else:
+                        log.info("Skipping resume upload - using LinkedIn resume")
+                        
+                # Upload cover letter if possible - only if use_linkedin_resume is False
                 if is_present(upload_cv_locator):
-                    cv = self.uploads["Cover Letter"]
-                    cv_locator = self.browser.find_element(By.XPATH, "//*[contains(@id, 'jobs-document-upload-file-input-upload-cover-letter')]")
-                    cv_locator.send_keys(cv)
+                    if not self.use_linkedin_resume and "Cover Letter" in self.uploads:
+                        try:
+                            cv = self.uploads["Cover Letter"]
+                            cv_locator = self.browser.find_element(By.XPATH, "//*[contains(@id, 'jobs-document-upload-file-input-upload-cover-letter')]")
+                            cv_locator.send_keys(cv)
+                            log.info("Uploaded local cover letter file")
+                        except Exception as e:
+                            log.error(f"Cover letter upload failed: {e}")
+                    else:
+                        log.info("Skipping cover letter upload - using LinkedIn resume")
 
                     #time.sleep(random.uniform(4.5, 6.5))
                 elif len(self.get_elements("follow")) > 0:
@@ -485,6 +668,13 @@ class EasyApplyBot:
                         submitted = True
                         break
                     elif len(elements) > 0:
+                        # Check if we should skip this job due to experience requirements
+                        if self.skip_zero_experience:
+                            form_fields = self.get_elements("fields")
+                            if self.check_experience_requirements(form_fields):
+                                log.info("Skipping job due to zero experience in required skills")
+                                return "skipped_experience"
+                            
                         while len(elements) > 0:
                             log.info("Please answer the questions, waiting 5 seconds...")
                             time.sleep(5)
@@ -582,6 +772,13 @@ class EasyApplyBot:
                 input.send_keys(answer)
 
     def ans_question(self, question): #refactor this to an ans.yaml file
+        # First check if we have a specific answer in our CSV file
+        if question in self.answers:
+            answer = self.answers[question]
+            log.info(f"Using saved answer for: {question} -> {answer}")
+            return answer
+        
+        # If not found in CSV, use hardcoded logic
         answer = None
         if "how many" in question:
             answer = "1"
@@ -623,9 +820,10 @@ class EasyApplyBot:
 
             # df = pd.DataFrame(self.answers, index=[0])
             # df.to_csv(self.qa_file, encoding="utf-8")
+        
         log.info("Answering question: " + question + " with answer: " + answer)
 
-        # Append question and answer to the CSV
+        # Append question and answer to the CSV for future reference
         if question not in self.answers:
             self.answers[question] = answer
             # Append a new question-answer pair to the CSV file
@@ -634,6 +832,201 @@ class EasyApplyBot:
             log.info(f"Appended to QA file: '{question}' with answer: '{answer}'.")
 
         return answer
+
+    def check_experience_requirements(self, form_fields):
+        """
+        Check if any experience-related questions would be answered with 0.
+        Returns True if we should skip this job (has zero experience requirements we can't meet).
+        """
+        try:
+            for field in form_fields:
+                question_text = field.text.lower().strip()
+                
+                # Skip if no question text
+                if not question_text:
+                    continue
+                
+                # Check if this is an experience-related question
+                experience_keywords = [
+                    "how many years", "years of experience", "years of work experience",
+                    "experience do you have", "how many years experience"
+                ]
+                
+                is_experience_question = any(keyword in question_text for keyword in experience_keywords)
+                
+                if is_experience_question:
+                    # Get what our answer would be
+                    answer = self.ans_question(question_text)
+                    
+                    # Check if answer is 0 or equivalent
+                    if str(answer).strip() in ['0', '0.0', 'None', 'none']:
+                        log.info(f"Skipping job: Zero experience required for '{question_text[:100]}...'")
+                        return True
+                        
+            return False
+            
+        except Exception as e:
+            log.error(f"Error checking experience requirements: {e}")
+            # If we can't check, don't skip the job
+            return False
+
+    def try_connect_with_recruiter(self, jobID):
+        """
+        Try to identify and connect with the recruiter for a job posting.
+        """
+        try:
+            log.info(f"Looking for recruiter information for job {jobID}")
+            
+            # Go back to job page to find recruiter info
+            self.get_job_page(jobID)
+            time.sleep(2)
+            
+            # Look for recruiter information in various places
+            recruiter_info = self.find_recruiter_info()
+            
+            if recruiter_info:
+                recruiter_name, recruiter_url, position_title = recruiter_info
+                log.info(f"Found recruiter: {recruiter_name} for position: {position_title}")
+                
+                # Navigate to recruiter profile and send connection
+                success = self.send_connection_invite(recruiter_name, recruiter_url, position_title)
+                if success:
+                    log.info(f"Successfully sent connection invite to {recruiter_name}")
+                    time.sleep(random.uniform(3, 6))  # Delay after connection
+                else:
+                    log.info(f"Failed to send connection invite to {recruiter_name}")
+            else:
+                log.info("No recruiter information found for this job")
+                
+        except Exception as e:
+            log.error(f"Error connecting with recruiter: {e}")
+
+    def find_recruiter_info(self):
+        """
+        Find recruiter information on the job page.
+        Returns (name, profile_url, position_title) or None if not found.
+        """
+        try:
+            # Get job title for the message
+            position_title = "this position"
+            try:
+                title_element = self.browser.find_element(By.CSS_SELECTOR, "h1.top-card-layout__title")
+                position_title = title_element.text.strip()
+            except:
+                pass
+            
+            # Look for recruiter info in various selectors
+            recruiter_selectors = [
+                "div.job-details-jobs-unified-top-card__primary-description-container a[href*='/in/']",
+                "div.jobs-poster a[href*='/in/']", 
+                "div.jobs-details__main-content a[href*='/in/']",
+                "a[data-control-name='job_details_job_poster_link']",
+                "div.job-details-jobs-unified-top-card__content a[href*='/in/']"
+            ]
+            
+            for selector in recruiter_selectors:
+                try:
+                    recruiter_elements = self.browser.find_elements(By.CSS_SELECTOR, selector)
+                    for element in recruiter_elements:
+                        recruiter_url = element.get_attribute('href')
+                        recruiter_name = element.text.strip()
+                        
+                        # Validate that this looks like a recruiter link
+                        if recruiter_url and '/in/' in recruiter_url and recruiter_name:
+                            # Skip company pages
+                            if '/company/' not in recruiter_url:
+                                log.info(f"Found potential recruiter: {recruiter_name} at {recruiter_url}")
+                                return recruiter_name, recruiter_url, position_title
+                except Exception as e:
+                    log.debug(f"Error with selector {selector}: {e}")
+                    continue
+            
+            return None
+            
+        except Exception as e:
+            log.error(f"Error finding recruiter info: {e}")
+            return None
+
+    def send_connection_invite(self, recruiter_name, recruiter_url, position_title):
+        """
+        Send a connection invite to the recruiter with a personalized message.
+        """
+        try:
+            # Navigate to recruiter profile
+            self.browser.get(recruiter_url)
+            time.sleep(random.uniform(2, 4))
+            
+            # Look for Connect button
+            connect_button = None
+            
+            # Try direct Connect button first
+            try:
+                connect_button = self.browser.find_element(By.XPATH, "//button[contains(text(), 'Connect') or @aria-label='Invite to connect']")
+            except:
+                pass
+            
+            # If no direct Connect button, try More dropdown
+            if not connect_button:
+                try:
+                    more_button = self.browser.find_element(By.XPATH, "//button[contains(text(), 'More') or @aria-label='More actions']")
+                    more_button.click()
+                    time.sleep(1)
+                    connect_button = self.browser.find_element(By.XPATH, "//div[@role='menu']//button[contains(text(), 'Connect')]")
+                except:
+                    pass
+            
+            if not connect_button:
+                log.warning(f"Connect button not found for {recruiter_name}")
+                return False
+            
+            # Click Connect button
+            connect_button.click()
+            time.sleep(2)
+            
+            # Look for "Add a note" button and click it
+            try:
+                add_note_button = self.browser.find_element(By.XPATH, "//button[contains(text(), 'Add a note')]")
+                add_note_button.click()
+                time.sleep(1)
+                
+                # Find message text area and enter personalized message
+                message_area = self.browser.find_element(By.CSS_SELECTOR, "textarea[name='message']")
+                
+                # Create personalized message
+                message = f"Hi {recruiter_name.split()[0]}. I'm Intizar, a Software Engineer and UK Global Talent Visa holder. I saw your post about a {position_title} opening and believe it's a strong match. I've built software for 250M+ users and would be glad to share more."
+                
+                # Ensure message is under LinkedIn's character limit (300 chars)
+                if len(message) > 299:
+                    message = f"Hi {recruiter_name.split()[0]}. I'm Intizar, a Software Engineer and UK Global Talent Visa holder. I saw your {position_title} post and believe it's a strong match. I've built software for 250M+ users."
+                
+                message_area.clear()
+                message_area.send_keys(message)
+                time.sleep(1)
+                
+                # Send the invite
+                send_button = self.browser.find_element(By.XPATH, "//button[contains(text(), 'Send') or contains(text(), 'Send invitation')]")
+                send_button.click()
+                time.sleep(2)
+                
+                log.info(f"Connection invite sent to {recruiter_name} with message: {message}")
+                return True
+                
+            except Exception as e:
+                log.warning(f"Could not add note to connection request: {e}")
+                # Try to send without note
+                try:
+                    send_button = self.browser.find_element(By.XPATH, "//button[contains(text(), 'Send') or contains(text(), 'Send invitation')]")
+                    send_button.click()
+                    time.sleep(2)
+                    log.info(f"Connection invite sent to {recruiter_name} without note")
+                    return True
+                except:
+                    log.error(f"Failed to send connection invite to {recruiter_name}")
+                    return False
+                    
+        except Exception as e:
+            log.error(f"Error sending connection invite to {recruiter_name}: {e}")
+            return False
 
     def load_page(self, sleep=1):
         scroll_page = 0
@@ -663,10 +1056,12 @@ class EasyApplyBot:
         # Construct the experience level part of the URL
         experience_level_str = ",".join(map(str, experience_level)) if experience_level else ""
         experience_level_param = f"&f_E={experience_level_str}" if experience_level_str else ""
+        # Add filter for jobs posted in last 7 days (604800 seconds)
+        date_filter = "&f_TPR=r604800"
         self.browser.get(
             # URL for jobs page
             "https://www.linkedin.com/jobs/search/?f_LF=f_AL&keywords=" +
-            position + location + "&start=" + str(jobs_per_page) + experience_level_param)
+            position + location + "&start=" + str(jobs_per_page) + experience_level_param + date_filter)
         #self.avoid_lock()
         log.info("Loading next job page?")
         self.load_page()
@@ -719,7 +1114,13 @@ if __name__ == '__main__':
                        filename=output_filename,
                        blacklist=blacklist,
                        blackListTitles=blackListTitles,
-                       experience_level=parameters.get('experience_level', [])
+                       experience_level=parameters.get('experience_level', []),
+                       max_applications=parameters.get('max_applications', 50),
+                       min_salary_yearly=parameters.get('min_salary_yearly', 60000),
+                       min_salary_hourly=parameters.get('min_salary_hourly', 32),
+                       send_recruiter_invites=parameters.get('send_recruiter_invites', True),
+                       skip_zero_experience=parameters.get('skip_zero_experience', True),
+                       use_linkedin_resume=parameters.get('use_linkedin_resume', True)
                        )
     bot.start_apply(positions, locations)
 

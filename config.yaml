@@ -1,6 +1,6 @@
-username: <username>
-password: <password>
-phone_number: <phone_number>
+username: intizar.tashov22@gmail.com
+password: Insignia@123
+phone_number: +447990226924
 
 profile_path: '' #can be empty, will default to 'C:\Users\<user>\AppData\Local\Google\Chrome\User Data\Default'
 
@@ -8,25 +8,41 @@ profile_path: '' #can be empty, will default to 'C:\Users\<user>\AppData\Local\G
 positions:
 - Software Engineer
 
-
 locations:
-- Michigan
-- Remote
+- United Kingdom
 
 salary: 60,000
-rate: 25
+rate: 32
+
+# --------- New Enhanced Parameters -------
+max_applications: 50  # Maximum number of applications per run
+min_salary_yearly: 60000  # Minimum yearly salary in pounds
+min_salary_hourly: 32  # Minimum hourly rate in pounds
+send_recruiter_invites: true  # Whether to send connection invites to recruiters
+skip_zero_experience: true  # Skip jobs where you have zero experience in required skills
+use_linkedin_resume: true  # Use existing LinkedIn resume instead of uploading files
 # --------- Optional Parameters -------
-uploads:
-  Resume: /Users/steven/Desktop/LinkedIn-Easy-Apply-Bot/cv.pdf
-  Cover Letter: /Users/steven/Desktop/LinkedIn-Easy-Apply-Bot/cl.pdf
-  #Photo: # PATH TO photo
+# uploads: # Not needed when use_linkedin_resume is true
+  # Resume: /Users/macbook/intizar/job_applications/LinkedIn-Easy-Apply-Bot/cv.pdf
+  # Cover Letter: /Users/macbook/intizar/job_applications/LinkedIn-Easy-Apply-Bot/cl.pdf
+  # Photo: # PATH TO photo
 
 
 output_filename:
-- /Users/steven/Desktop/LinkedIn-Easy-Apply-Bot/out.csv
+- /Users/macbook/intizar/job_applications/LinkedIn-Easy-Apply-Bot/out.csv
 
-# blacklist:
-# - # Company names you want to ignore
+blacklist:
+- # Company names you want to ignore
+
+blackListTitles:
+- frontend
+- Frontend
+- Front End
+- Front-End
+- UI/UX
+- React Developer
+- Vue Developer
+- Angular Developer
 
 experience_level:
   # - 1 # Entry level
