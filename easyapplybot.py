@@ -728,6 +728,12 @@ class EasyApplyBot:
     def process_questions(self):
         time.sleep(1)
         form = self.get_elements("fields") #self.browser.find_elements(By.CLASS_NAME, "jobs-easy-apply-form-section__grouping")
+        
+        if not form:
+            log.info("No form fields found - LinkedIn may have remembered all answers")
+            return
+            
+        log.info(f"Processing {len(form)} form fields")
         for field in form:
             question = field.text
             answer = self.ans_question(question.lower())
@@ -772,19 +778,28 @@ class EasyApplyBot:
                 input.send_keys(answer)
 
     def ans_question(self, question): #refactor this to an ans.yaml file
+        log.debug(f"Processing question: {question}")
+        
+        # Special logging for visa-related questions to help with debugging
+        visa_keywords = ["sponsor", "visa", "require visa", "need visa", "visa sponsorship", 
+                        "work authorization", "legally authorized", "work permit", "require sponsorship"]
+        if any(keyword in question.lower() for keyword in visa_keywords):
+            log.warning(f"🔍 VISA QUESTION DETECTED: {question}")
+        
         # First check if we have a specific answer in our CSV file
         if question in self.answers:
             answer = self.answers[question]
             log.info(f"Using saved answer for: {question} -> {answer}")
             return answer
         
+        log.debug(f"Question not found in CSV, using hardcoded logic for: {question}")
         # If not found in CSV, use hardcoded logic
         answer = None
         if "how many" in question:
             answer = "1"
         elif "experience" in question:
             answer = "1"
-        elif "sponsor" in question:
+        elif any(keyword in question for keyword in ["sponsor", "visa", "require visa", "need visa", "visa sponsorship", "work authorization", "legally authorized", "work permit"]):
             answer = "No"
         elif 'do you ' in question:
             answer = "Yes"
@@ -813,9 +828,18 @@ class EasyApplyBot:
         elif "are you legally" in question:
             answer = "Yes"
         else:
+            log.warning(f"❌ UNHANDLED QUESTION: {question}")
             log.info("Not able to answer question automatically. Please provide answer")
             #open file and document unanswerable questions, appending to it
             answer = "user provided"
+            
+            # Log to a separate file for debugging unhandled questions
+            try:
+                with open("unhandled_questions.log", "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.now()}: {question}\n")
+            except Exception as e:
+                log.error(f"Failed to log unhandled question: {e}")
+                
             time.sleep(15)
 
             # df = pd.DataFrame(self.answers, index=[0])
@@ -823,13 +847,19 @@ class EasyApplyBot:
         
         log.info("Answering question: " + question + " with answer: " + answer)
 
-        # Append question and answer to the CSV for future reference
+        # Always append new questions to CSV for future reference
+        # (even if we found an answer through hardcoded logic)
         if question not in self.answers:
             self.answers[question] = answer
-            # Append a new question-answer pair to the CSV file
-            new_data = pd.DataFrame({"Question": [question], "Answer": [answer]})
-            new_data.to_csv(self.qa_file, mode='a', header=False, index=False, encoding='utf-8')
-            log.info(f"Appended to QA file: '{question}' with answer: '{answer}'.")
+            try:
+                # Append a new question-answer pair to the CSV file
+                new_data = pd.DataFrame({"Question": [question], "Answer": [answer]})
+                new_data.to_csv(self.qa_file, mode='a', header=False, index=False, encoding='utf-8')
+                log.info(f"Appended to QA file: '{question}' with answer: '{answer}'.")
+            except Exception as e:
+                log.error(f"Failed to append to QA file: {e}")
+        else:
+            log.debug(f"Question already exists in answers dictionary: {question}")
 
         return answer
 
@@ -913,10 +943,54 @@ class EasyApplyBot:
                 title_element = self.browser.find_element(By.CSS_SELECTOR, "h1.top-card-layout__title")
                 position_title = title_element.text.strip()
             except:
-                pass
+                try:
+                    title_element = self.browser.find_element(By.CSS_SELECTOR, "h1")
+                    position_title = title_element.text.strip()
+                except:
+                    pass
             
-            # Look for recruiter info in various selectors
+            log.info("Looking for recruiter in 'Meet the hiring team' section...")
+            
+            # First, look for "Meet the hiring team" section
+            try:
+                hiring_team_section = self.browser.find_element(By.XPATH, "//*[contains(text(), 'Meet the hiring team')]")
+                log.info("Found 'Meet the hiring team' section")
+                
+                # Look for aria-label with pattern "View [Name]'s verified profile graphic"
+                aria_label_selectors = [
+                    "//a[contains(@aria-label, \"verified profile graphic\")]",
+                    "//a[contains(@aria-label, \"View\") and contains(@aria-label, \"profile\")]"
+                ]
+                
+                for selector in aria_label_selectors:
+                    try:
+                        recruiter_elements = self.browser.find_elements(By.XPATH, selector)
+                        for element in recruiter_elements:
+                            aria_label = element.get_attribute('aria-label')
+                            recruiter_url = element.get_attribute('href')
+                            
+                            if aria_label and recruiter_url:
+                                # Extract name from aria-label like "View Jordan Clayton's verified profile graphic"
+                                name_match = re.search(r"View\s+(.+?)'s\s+.*profile", aria_label)
+                                if name_match:
+                                    recruiter_name = name_match.group(1).strip()
+                                    log.info(f"Found recruiter via aria-label: {recruiter_name} at {recruiter_url}")
+                                    return recruiter_name, recruiter_url, position_title
+                    except Exception as e:
+                        log.debug(f"Error with aria-label selector {selector}: {e}")
+                        continue
+                        
+            except Exception as e:
+                log.debug(f"No 'Meet the hiring team' section found: {e}")
+            
+            # Fallback: Look for recruiter info in other common locations
+            log.info("Trying fallback selectors...")
             recruiter_selectors = [
+                # Modern LinkedIn selectors
+                "a[href*='/in/'][aria-label*='profile']",
+                "div[data-test-id*='hiring-team'] a[href*='/in/']",
+                "div[data-test-id*='job-poster'] a[href*='/in/']",
+                # Legacy selectors
                 "div.job-details-jobs-unified-top-card__primary-description-container a[href*='/in/']",
                 "div.jobs-poster a[href*='/in/']", 
                 "div.jobs-details__main-content a[href*='/in/']",
@@ -930,16 +1004,50 @@ class EasyApplyBot:
                     for element in recruiter_elements:
                         recruiter_url = element.get_attribute('href')
                         recruiter_name = element.text.strip()
+                        aria_label = element.get_attribute('aria-label')
                         
                         # Validate that this looks like a recruiter link
-                        if recruiter_url and '/in/' in recruiter_url and recruiter_name:
+                        if recruiter_url and '/in/' in recruiter_url:
                             # Skip company pages
                             if '/company/' not in recruiter_url:
-                                log.info(f"Found potential recruiter: {recruiter_name} at {recruiter_url}")
-                                return recruiter_name, recruiter_url, position_title
+                                # Prefer aria-label for name if available
+                                if aria_label and 'profile' in aria_label.lower():
+                                    name_match = re.search(r"View\s+(.+?)'s", aria_label)
+                                    if name_match:
+                                        recruiter_name = name_match.group(1).strip()
+                                
+                                if recruiter_name:
+                                    log.info(f"Found recruiter via fallback: {recruiter_name} at {recruiter_url}")
+                                    return recruiter_name, recruiter_url, position_title
                 except Exception as e:
-                    log.debug(f"Error with selector {selector}: {e}")
+                    log.debug(f"Error with fallback selector {selector}: {e}")
                     continue
+            
+            # Debug: Log all links on the page for troubleshooting
+            try:
+                all_links = self.browser.find_elements(By.CSS_SELECTOR, "a[href*='/in/']")
+                log.debug(f"Found {len(all_links)} LinkedIn profile links on page")
+                for i, link in enumerate(all_links[:5]):  # Log first 5 for debugging
+                    href = link.get_attribute('href')
+                    text = link.text.strip()
+                    aria_label = link.get_attribute('aria-label')
+                    log.debug(f"Link {i+1}: href={href}, text='{text}', aria-label='{aria_label}'")
+            except Exception as e:
+                log.debug(f"Debug logging failed: {e}")
+            
+            log.warning("No recruiter information found with any method")
+            
+            # Take a screenshot for debugging (if enabled in debug mode)
+            try:
+                import os
+                if not os.path.exists("debug_screenshots"):
+                    os.makedirs("debug_screenshots")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                screenshot_path = f"debug_screenshots/no_recruiter_{timestamp}.png"
+                self.browser.save_screenshot(screenshot_path)
+                log.debug(f"Saved debug screenshot: {screenshot_path}")
+            except Exception as e:
+                log.debug(f"Failed to save debug screenshot: {e}")
             
             return None
             
@@ -1058,14 +1166,19 @@ class EasyApplyBot:
         experience_level_param = f"&f_E={experience_level_str}" if experience_level_str else ""
         # Add filter for jobs posted in last 7 days (604800 seconds)
         date_filter = "&f_TPR=r604800"
-        self.browser.get(
-            # URL for jobs page
-            "https://www.linkedin.com/jobs/search/?f_LF=f_AL&keywords=" +
-            position + location + "&start=" + str(jobs_per_page) + experience_level_param + date_filter)
+        
+        # Increment jobs_per_page to go to next page (LinkedIn shows 25 jobs per page)
+        next_page = jobs_per_page + 25
+        
+        url = ("https://www.linkedin.com/jobs/search/?f_LF=f_AL&keywords=" +
+               position + location + "&start=" + str(next_page) + experience_level_param + date_filter)
+        
+        log.info(f"Loading next job page: {next_page}")
+        log.debug(f"Full URL: {url}")
+        self.browser.get(url)
         #self.avoid_lock()
-        log.info("Loading next job page?")
         self.load_page()
-        return (self.browser, jobs_per_page)
+        return (self.browser, next_page)
 
     # def finish_apply(self) -> None:
     #     self.browser.close()

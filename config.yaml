@@ -32,7 +32,8 @@ output_filename:
 - /Users/macbook/intizar/job_applications/LinkedIn-Easy-Apply-Bot/out.csv
 
 blacklist:
-- # Company names you want to ignore
+- Oho Group Ltd
+- Oliver Bernard
 
 blackListTitles:
 - frontend
